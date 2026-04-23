@@ -1,5 +1,5 @@
-// What: Production-ready HF proxy
-// Why: Reliable AI API with fallback, timeout, clean response
+// What: Stable HF proxy with retry + proper handling
+// Why: Fix model loading, free-tier issues, and unreliable responses
 
 import express from "express";
 import fetch from "node-fetch";
@@ -9,45 +9,30 @@ app.use(express.json());
 
 const HF_TOKEN = process.env.HF_TOKEN;
 
-// Models (primary + fallback)
+// Use stable models
 const MODELS = [
-  "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
-  "https://api-inference.huggingface.co/models/gpt2"
+  "distilbert-base-uncased-finetuned-sst-2-english", // fast + reliable
+  "gpt2" // fallback
 ];
 
-// Helper: fetch with timeout
-const fetchWithTimeout = async (url, options, timeout = 15000) => {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeout);
+// Retry helper
+const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-    clearTimeout(id);
-    return response;
-  } catch (err) {
-    clearTimeout(id);
-    throw err;
-  }
-};
-
-// Health route
+// Health check
 app.get("/", (req, res) => {
   res.send("OK");
 });
 
-// Test HF endpoint
+// Main endpoint
 app.post("/test-hf", async (req, res) => {
-  const inputText = req.body?.input || "Say WORKING";
+  const inputText = req.body?.input || "I love AI";
 
   for (let model of MODELS) {
     try {
       console.log("Trying model:", model);
 
-      const response = await fetchWithTimeout(
-        model,
+      const response = await fetch(
+        `https://api-inference.huggingface.co/models/${model}`,
         {
           method: "POST",
           headers: {
@@ -55,43 +40,40 @@ app.post("/test-hf", async (req, res) => {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ inputs: inputText }),
-        },
-        20000
+        }
       );
 
-      const contentType = response.headers.get("content-type");
+      const data = await response.json();
 
-      // Try JSON parse
-      if (contentType && contentType.includes("application/json")) {
-        const data = await response.json();
-
-        // HF loading case
-        if (data.error) {
-          console.log("HF error:", data.error);
-          continue;
-        }
-
-        return res.json({
-          success: true,
-          model,
-          output: data,
-        });
+      // Model loading case (VERY COMMON)
+      if (data.error && data.error.includes("loading")) {
+        console.log("Model loading... retrying");
+        await delay(5000); // wait 5s
+        continue;
       }
 
-      // If not JSON → skip
-      console.log("Non-JSON response, trying next model");
-      continue;
+      // Any other HF error
+      if (data.error) {
+        console.log("HF error:", data.error);
+        continue;
+      }
+
+      return res.json({
+        success: true,
+        model,
+        input: inputText,
+        output: data,
+      });
 
     } catch (err) {
-      console.log("Error with model:", model, err.message);
+      console.log("Error:", err.message);
       continue;
     }
   }
 
-  // If all models fail
   return res.status(500).json({
     success: false,
-    error: "All models failed. Try again later.",
+    error: "All models failed. Check HF token or wait for model loading.",
   });
 });
 
