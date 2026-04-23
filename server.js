@@ -1,5 +1,5 @@
-// What: Stable HF proxy with retry + proper handling
-// Why: Fix model loading, free-tier issues, and unreliable responses
+// What: Production-grade HF proxy
+// Why: Handles free-tier issues, retries, timeouts, non-JSON safely
 
 import express from "express";
 import fetch from "node-fetch";
@@ -9,71 +9,105 @@ app.use(express.json());
 
 const HF_TOKEN = process.env.HF_TOKEN;
 
-// Use stable models
+// Stable models
 const MODELS = [
-  "distilbert-base-uncased-finetuned-sst-2-english", // fast + reliable
-  "gpt2" // fallback
+  "distilbert-base-uncased-finetuned-sst-2-english",
+  "gpt2"
 ];
 
-// Retry helper
+// Config
+const MAX_RETRIES = 3;
+const TIMEOUT = 15000;
+
+// Delay helper
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 
-// Health check
-app.get("/", (req, res) => {
-  res.send("OK");
-});
+// Fetch with timeout
+const fetchWithTimeout = async (url, options, timeout) => {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return res;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+};
+
+// Health
+app.get("/", (req, res) => res.send("OK"));
 
 // Main endpoint
 app.post("/test-hf", async (req, res) => {
   const inputText = req.body?.input || "I love AI";
 
   for (let model of MODELS) {
-    try {
-      console.log("Trying model:", model);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(`Trying ${model} (attempt ${attempt})`);
 
-      const response = await fetch(
-        `https://api-inference.huggingface.co/models/${model}`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${HF_TOKEN}`,
-            "Content-Type": "application/json",
+        const response = await fetchWithTimeout(
+          `https://api-inference.huggingface.co/models/${model}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${HF_TOKEN}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ inputs: inputText }),
           },
-          body: JSON.stringify({ inputs: inputText }),
+          TIMEOUT
+        );
+
+        let data;
+
+        // SAFE JSON parsing
+        try {
+          data = await response.json();
+        } catch {
+          console.log("Non-JSON response from HF");
+          continue;
         }
-      );
 
-      const data = await response.json();
+        // Cold start handling
+        if (data.error && data.error.includes("loading")) {
+          console.log("Model loading... waiting");
+          await delay(4000);
+          continue;
+        }
 
-      // Model loading case (VERY COMMON)
-      if (data.error && data.error.includes("loading")) {
-        console.log("Model loading... retrying");
-        await delay(5000); // wait 5s
-        continue;
+        // Other HF errors
+        if (data.error) {
+          console.log("HF error:", data.error);
+          break;
+        }
+
+        // SUCCESS
+        console.log("HF SUCCESS:", data);
+
+        return res.json({
+          success: true,
+          model,
+          attempt,
+          input: inputText,
+          output: data,
+        });
+
+      } catch (err) {
+        console.log("Request error:", err.message);
+
+        if (attempt === MAX_RETRIES) break;
+        await delay(2000);
       }
-
-      // Any other HF error
-      if (data.error) {
-        console.log("HF error:", data.error);
-        continue;
-      }
-
-      return res.json({
-        success: true,
-        model,
-        input: inputText,
-        output: data,
-      });
-
-    } catch (err) {
-      console.log("Error:", err.message);
-      continue;
     }
   }
 
   return res.status(500).json({
     success: false,
-    error: "All models failed. Check HF token or wait for model loading.",
+    error: "All models failed after retries",
   });
 });
 
